@@ -1,0 +1,26 @@
+[
+  {
+    "id": "item_001",
+    "category": "Shirt",
+    "primary_color": "White",
+    "secondary_color": "None",
+    "style": "Casual",
+    "season": "Summer",
+    "occasion": "Everyday",
+    "material": "Cotton",
+    "fit": "Regular",
+    "image_path": "assets/sample_shirt.jpg"
+  },
+  {
+    "id": "item_002",
+    "category": "Jeans",
+    "primary_color": "Blue",
+    "secondary_color": "None",
+    "style": "Casual",
+    "season": "All",
+    "occasion": "Everyday",
+    "material": "Denim",
+    "fit": "Slim",
+    "image_path": "assets/sample_pants.jpg"
+  }
+]

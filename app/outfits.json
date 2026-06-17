@@ -1,0 +1,28 @@
+[
+  {
+    "id": "outfit_001",
+    "name": "Summer Casual White",
+    "occasion": "Everyday",
+    "style": "Casual",
+    "season": [
+      "Summer"
+    ],
+    "weather": {
+      "temperature": "hot",
+      "condition": "sunny"
+    },
+    "items": [
+      "item_001"
+    ],
+    "score": 85,
+    "user_rating": null,
+    "liked": false,
+    "favorite": false,
+    "times_worn": 0,
+    "last_worn": null,
+    "reasoning": [
+      "Classic light setup for warm weather."
+    ],
+    "created_at": "2026-06-16"
+  }
+]
