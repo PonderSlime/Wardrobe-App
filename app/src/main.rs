@@ -1,7 +1,7 @@
-use eframe::egui;
+use eframe::egui::{self, accesskit::AriaCurrent::False};
 use rfd::MessageDialogResult::No;
-use std::time::Instant;
-use std::fs;
+use std::{os::raw, time::Instant};
+use std::{clone, fs};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -62,7 +62,12 @@ enum AddItemState {
         texture: egui::TextureHandle // Store the loaded texture here
     },
 }
-
+enum OutfitState {
+    Idle,
+    Processing { 
+        receiver: std::sync::mpsc::Receiver<Result<Outfit, String>> 
+    },
+}
 // 3. Main App Struct
 struct MyApp {
     active_tab: Tab,
@@ -72,6 +77,9 @@ struct MyApp {
     inventory_list: Vec<InventoryItem>,            // Ordered list for the grid
     outfits_list: Vec<Outfit>,
     outfit_collage_cache: HashMap<String, egui::TextureHandle>,
+    show_create_outfit_popup: bool,
+    outfit_prompt: String,
+    outfit_state: OutfitState,
     // UI Selection Tracking (Now tracking by string IDs)
     selected_inventory_item_id: Option<String>,
     selected_outfit_id: Option<String>,
@@ -91,6 +99,9 @@ impl Default for MyApp {
             outfits_list: Vec::new(),                        // Initialized empty
             selected_inventory_item_id: None,
             outfit_collage_cache: HashMap::new(),
+            show_create_outfit_popup: false,
+            outfit_prompt: String::new(),
+            outfit_state: OutfitState::Idle,
             selected_outfit_id: None,
             navigation_source_outfit_id: None,
             add_item_state: AddItemState::Idle { error: None },
@@ -178,6 +189,17 @@ impl eframe::App for MyApp {
                 Tab::AddItem => self.show_add_item(ctx, ui),
             }
         });
+        if let OutfitState::Processing { receiver } = &self.outfit_state {
+            if let Ok(result) = receiver.try_recv() {
+                match result {
+                    Ok(outfit) => {
+                        self.outfits_list.push(outfit);
+                        self.outfit_state = OutfitState::Idle;
+                    },
+                    Err(e) => println!("Error: {}", e),
+                }
+            }
+        }
     }
 }
 
@@ -216,9 +238,17 @@ impl MyApp {
             };
 
             // Step C: Look up the item data *again* to draw the text properties safely
-            if let Some(item) = self.inventory_map.get(&item_id) {
-                ui.heading(format!("Item: {}", item.id));
-                
+            if let Some(item) = &self.inventory_map.clone().get(&item_id) {
+                ui.horizontal(|ui| {
+                    ui.heading(format!("Item: {}", item.id));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let delete_btn = egui::Button::new(egui::RichText::new("🗑 Delete Item").color(egui::Color32::LIGHT_RED));
+                            if ui.add(delete_btn).clicked() {
+                                // Call our removal method using a cloned ID string to avoid borrow errors
+                                self.delete_inventory_item(&item_id.clone());
+                            }
+                    });
+                });
                 // Draw real image
                 let img_size = egui::vec2(400.0,300.0);
                 if let Some(texture_handle) = self.image_cache.get(&item.image_path) {
@@ -311,132 +341,343 @@ impl MyApp {
             });
         }
     }
-
-    // TAB 2: Outfits
-    fn show_outfits(&mut self, ui: &mut egui::Ui) {
-        if let Some(outfit_id) = &self.selected_outfit_id {
-        // --- OUTFIT DETAIL VIEW ---
-        let mut go_back = false;
-        let mut jump_to_inventory_id: Option<String> = None;
-
-        if ui.button("⬅ Back to Outfits").clicked() {
-            go_back = true;
-        }
-        ui.separator();
-
-        // Step A: Find and Clone the outfit to completely free up the borrow on self
-        let current_outfit = self.outfits_list.iter().find(|o| o.id == *outfit_id).cloned();
-
-        if let Some(outfit) = current_outfit {
-
-            let texture_id =
-                self.get_cached_image(ui.ctx(), &outfit.collage_path);
-            ui.horizontal(|ui| {
-                ui.heading(&outfit.name);
-                if outfit.favorite { ui.colored_label(egui::Color32::from_rgb(255, 215, 0), "⭐ Favorite"); }
-                if outfit.liked { ui.colored_label(egui::Color32::LIGHT_RED, "❤️ Liked"); }
-            });
+    fn delete_inventory_item(&mut self, item_id: &str) {
+        // 1. If it exists, find the file path and delete the image from disk
+        if let Some(item) = self.inventory_map.remove(item_id) {
+            let _ = std::fs::remove_file(&item.image_path);
             
-            ui.small(format!("ID: {} | Created: {}", outfit.id, outfit.created_at));
-            ui.add_space(10.0);
+            // Also clean up your UI image cache so egui forgets the texture handle
+            self.image_cache.remove(&item.image_path);
+        }
 
-            // Draw the outfit image
-            let img_size = egui::vec2(400.0,300.0);
-            /* if let Some(texture_handle) = self.image_cache.get(&img_path) {
-                    let preview_image = egui::Image::new(texture_handle)
-                        // 2. Set your bounding box
-                        .max_size(egui::vec2(400.0, 300.0)) 
-                        .fit_to_exact_size(img_size)
-                        // 3. Add your styling
-                        .corner_radius(8.0);
-                    ui.add(preview_image);
-                } */
-            if let Some(texture_handle) =
-                self.image_cache.get(&outfit.collage_path)
-            {
-                ui.add(
-                    egui::Image::new(texture_handle)
-                        .fit_to_exact_size(egui::vec2(400.0, 300.0))
-                        .corner_radius(8.0)
-                );
-            }
+        // 2. Remove it from your runtime display vector
+        self.inventory_list.retain(|i| i.id != item_id);
 
-            ui.add_space(15.0);
+        // 3. Save the clean vector back to inventory.json
+        if let Ok(updated_string) = serde_json::to_string_pretty(&self.inventory_list) {
+            let _ = std::fs::write("inventory.json", updated_string);
+        }
+        
+        // 4. Close the detail view if the deleted item was open
+        if self.selected_inventory_item_id.as_deref() == Some(item_id) {
+            self.selected_inventory_item_id = None;
+        }
+    }
 
-            egui::Grid::new("outfit_metadata_grid").num_columns(2).spacing([40.0, 8.0]).show(ui, |ui| {
-                ui.label("Style:"); ui.label(&outfit.style); ui.end_row();
-                ui.label("Occasion:"); ui.label(&outfit.occasion); ui.end_row();
-                ui.label("Seasons:"); ui.label(outfit.season.join(", ")); ui.end_row();
+    fn delete_outfit(&mut self, outfit_id: &str) {
+        // 1. Find the outfit, delete its collage image, and drop from image cache
+        if let Some(index) = self.outfits_list.iter().position(|o| o.id == outfit_id) {
+            let outfit = &self.outfits_list[index];
+            let _ = std::fs::remove_file(&outfit.collage_path);
+            self.image_cache.remove(&outfit.collage_path);
+        }
+
+        // 2. Remove it from your runtime display vector
+        self.outfits_list.retain(|o| o.id != outfit_id);
+
+        // 3. Save the clean vector back to outfits.json
+        if let Ok(updated_string) = serde_json::to_string_pretty(&self.outfits_list) {
+            let _ = std::fs::write("outfits.json", updated_string);
+        }
+
+        // 4. Close the detail view if the deleted outfit was open
+        if self.selected_outfit_id.as_deref() == Some(outfit_id) {
+            self.selected_outfit_id = None;
+        }
+    }
+    fn process_new_outfit_with_ai(prompt: String, items: Vec<InventoryItem>) -> std::sync::mpsc::Receiver<Result<Outfit, String>> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let ollama = ollama_rs::Ollama::default();
                 
-                let rating_str = outfit.user_rating.map(|r| r.to_string()).unwrap_or_else(|| "Unrated".to_string());
-                ui.label("Score / Rating:"); ui.label(format!("Score: {} | User Rating: {}", outfit.score, rating_str)); ui.end_row();
+                // 1. Construct prompt to pick IDs from provided items
+                let item_list_json = serde_json::to_string(&items).unwrap();
+                let full_prompt = format!(
+                    "Create an outfit from these items: {}. Prompt: {}. \
+                    Return JSON: {{ \"name\": \"string\", \"occasion\": \"string\", \"style\": \"string\", \
+                    \"season\": [], \"weather\": {{}}, \"items\": [], \"score\": \"integer\", \"reasoning\": [] }} the json items array should be an array of the items ids only.", 
+                    item_list_json, 
+                    prompt
+                );
+                // 2. Call Ollama
+                let fast_options = ollama_rs::models::ModelOptions::default()
+                    .temperature(0.0)      // 0.0 makes the model deterministic and much faster
+                    .num_predict(120)      // Caps the length so it stops instantly when JSON finishes
+                    .top_k(20)             // Limits pool of choices for quicker token evaluation
+                    .top_p(0.5);
+                let result = ollama.generate(ollama_rs::generation::completion::request::GenerationRequest::new("gemma3:4b".into(), full_prompt)).await; //.options(fast_options)).await;
+                
+                // 3. Logic to create collage:
+                // Use your create_outfit_collage function here to save a file to assets/collages/
+                // ... logic to save file ...
+                
+                // 4. Send back the final Outfit struct
+                // ... after receiving the AI response string ...
+                
+                let raw_response = match result {
+                    Ok(res) => res.response, // This is already the string you want!
+                    Err(e) => {
+                        // Handle the error (send it to your channel so the UI sees it)
+                        let _ = sender.send(Err(format!("Pipeline error: {}", e)));
+                        return; // Exit the thread gracefully
+                    }
+                };
 
-                let last_worn_str = outfit.last_worn.as_deref().unwrap_or("Never");
-                ui.label("Stats:"); ui.label(format!("Worn {} times (Last: {})", outfit.times_worn, last_worn_str)); ui.end_row();
-            });
+                // 3. You now have 'raw_response' as a standard Rust String
+                println!("AI returned: {}", raw_response);
+                let ai_response: String = raw_response;
 
-            if !outfit.reasoning.is_empty() {
-                ui.add_space(15.0);
-                ui.strong("AI Styling Reasoning:");
-                for line in &outfit.reasoning {
-                    ui.label(format!("• {}", line));
+                // Parse the raw string into a generic JSON value first
+                let mut parsed_json: serde_json::Value = serde_json::from_str(&ai_response).unwrap_or_default();
+                // 6. Clean up the response from any accidental markdown block wrappers
+                let clean_json = &ai_response.trim_start_matches("```json")
+                    .trim_start_matches("```")
+                    .trim_start_matches("```json")
+                    .trim_end_matches("```")
+                    .trim();
+
+                // 7. Parse the cleaned string into our local structures
+                let mut parsed_json: serde_json::Value = match serde_json::from_str(clean_json) {
+                    Ok(v) => v,
+                    Err(e) => { 
+                        let _ = sender.send(Err(format!("JSON Parse Fail: {}. Raw output was: {}", e, ai_response))); 
+                        return; 
+                    }
+                };
+                // Inject your internal meta-data
+                let id = format!("outfit_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
+                parsed_json["id"] = serde_json::Value::String(id.clone());
+                parsed_json["created_at"] = serde_json::Value::String("2026-06-17".to_string()); // Or use chrono crate
+                parsed_json["collage_path"] = serde_json::Value::String(format!("assets/outfits/{}.png", id));
+                //parsed_json["score"] = serde_json::json!(0);
+                parsed_json["user_rating"] = serde_json::Value::Null;
+                parsed_json["liked"] = serde_json::Value::Bool((false));
+                parsed_json["favorite"] = serde_json::Value::Bool((false));
+                parsed_json["times_worn"] = serde_json::json!(0);
+                parsed_json["last_worn"] = serde_json::Value::Null;
+                
+                let chosen_ids: Vec<String> = parsed_json["items"]
+                    .as_array()
+                    .unwrap_or(&vec![])
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect();
+                // Convert the JSON value to your actual Outfit struct
+                let final_outfit: Outfit = match serde_json::from_value(parsed_json) {
+                    Ok(outfit) => outfit,
+                    Err(e) => {
+                        // Send the mapping error back to your UI thread
+                        let _ = sender.send(Err(format!("Schema mapping failure: {}", e)));
+                        return; // Gracefully stop execution in this background thread
+                    }
+                };
+                if let Err(e) = std::fs::create_dir_all("assets/outfits") {
+                    let _ = sender.send(Err(format!("Could not create collages directory: {}", e)));
+                    return;
                 }
-            }
-
-            ui.add_space(20.0);
-            ui.heading("Included Inventory Items:");
-            ui.horizontal_wrapped(|ui| {
-                // Collect data to break the borrow
-                let sub_items: Vec<(String, String, String)> = outfit.items.iter()
-                    .filter_map(|id| self.inventory_map.get(id))
-                    .map(|item| (item.id.clone(), item.category.clone(), item.image_path.clone()))
+                
+                let item_paths: Vec<String> = items.iter()
+                    .filter(|item| chosen_ids.contains(&item.id))
+                    .take(4)
+                    .map(|item| item.image_path.clone())
                     .collect();
 
-                for (id, category, path) in sub_items {
-                    let sub_texture_id = self.get_cached_image(ui.ctx(), &path);
-                    
-                    // 1. Allocate the space for the card
-                    let (rect, response) = ui.allocate_exact_size(egui::vec2(90.0, 110.0), egui::Sense::click());
-                    
-                    // 2. Draw the background
-                    let bg_color = if response.hovered() { egui::Color32::from_rgb(50, 70, 100) } else { egui::Color32::from_rgb(30, 45, 70) };
-                    ui.painter().rect_filled(rect, 5.0, bg_color);
-                    
-                    // 3. Use allocate_ui_at_rect to perfectly center content inside the card
-                    ui.allocate_ui_at_rect(rect, |ui| {
-                        ui.vertical_centered(|ui| {
-                            ui.add_space(5.0);
-                            
-                            // Draw the image centered
-                            ui.add(egui::Image::from_texture((sub_texture_id, egui::vec2(80.0, 75.0))).corner_radius(3.0));
-                            
-                            ui.add_space(5.0);
-                            
-                            // Draw the text centered
-                            ui.label(egui::RichText::new(&category).size(10.0).color(egui::Color32::WHITE));
-                        });
-                    });
+                // 3. Call your custom function!
+                let canvas = create_outfit_collage(&item_paths);
 
-                    // 4. Handle click logic
-                    if response.clicked() {
-                        jump_to_inventory_id = Some(id); // Or use your logic to find the original ID
+                // 4. Save the returned RgbaImage directly to the disk
+                if let Err(e) = canvas.save(&final_outfit.collage_path) {
+                    let _ = sender.send(Err(format!("Failed to save collage image: {}", e)));
+                    return;
+                }
+                let mut current_items: Vec<Outfit> = std::fs::read_to_string("outfits.json")
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default();
+
+                current_items.push(final_outfit.clone());
+
+                if let Ok(updated_string) = serde_json::to_string_pretty(&current_items) {
+                    let _ = std::fs::write("outfits.json", updated_string);
+                    println!("saving outfit!!");
+                }
+
+                // Send the ready item straight back to our main eframe loop
+                
+                let _ = sender.send(Ok(final_outfit));
+                
+            });
+        });
+        receiver
+    }
+    // TAB 2: Outfits
+    fn show_outfits(&mut self, ui: &mut egui::Ui) {
+        if self.show_create_outfit_popup {
+            egui::Window::new("Create Outfit")
+                .collapsible(false)
+                .resizable(false)
+                .show(ui.ctx(), |ui| {
+
+                    ui.label("Describe the outfit you want:");
+
+                    ui.text_edit_multiline(
+                        &mut self.outfit_prompt
+                    );
+
+                    if ui.button("Generate").clicked() {
+                        // 1. Gather selected items (you might need to track selected items in MyApp)
+                        let selected = self.inventory_list.clone(); // Replace with your actual selection logic
+                        
+                        // 2. Start Thread
+                        let rx = Self::process_new_outfit_with_ai(self.outfit_prompt.clone(), selected);
+                        self.outfit_state = OutfitState::Processing { receiver: rx };
+                        self.show_create_outfit_popup = false;
+                        println!("Generating outfit!!");
+                    }
+
+                    if ui.button("Cancel").clicked() {
+                        self.show_create_outfit_popup = false;
+                    }
+                });
+        }
+        if let Some(outfit_id) = &self.selected_outfit_id {
+            // --- OUTFIT DETAIL VIEW ---
+            let mut go_back = false;
+            let mut jump_to_inventory_id: Option<String> = None;
+
+            if ui.button("⬅ Back to Outfits").clicked() {
+                go_back = true;
+            }
+            ui.separator();
+
+            // Step A: Find and Clone the outfit to completely free up the borrow on self
+            let current_outfit = self.outfits_list.iter().find(|o| o.id == *outfit_id).cloned();
+
+            if let Some(outfit) = current_outfit {
+
+                let texture_id =
+                    self.get_cached_image(ui.ctx(), &outfit.collage_path);
+                
+                ui.horizontal(|ui| {
+                    ui.heading(&outfit.name);
+                    if outfit.favorite { ui.colored_label(egui::Color32::from_rgb(255, 215, 0), "⭐ Favorite"); }
+                    if outfit.liked { ui.colored_label(egui::Color32::LIGHT_RED, "❤️ Liked"); }
+                    
+                    // Push the delete button to the far right of the outfit header row
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let delete_btn = egui::Button::new(egui::RichText::new("🗑 Delete Outfit").color(egui::Color32::LIGHT_RED));
+                        if ui.add(delete_btn).clicked() {
+                            self.delete_outfit(&outfit.id.clone());
+                        }
+                    });
+                });
+                
+                ui.small(format!("ID: {} | Created: {}", outfit.id, outfit.created_at));
+                ui.add_space(10.0);
+
+                // Draw the outfit image
+                let img_size = egui::vec2(400.0,300.0);
+                /* if let Some(texture_handle) = self.image_cache.get(&img_path) {
+                        let preview_image = egui::Image::new(texture_handle)
+                            // 2. Set your bounding box
+                            .max_size(egui::vec2(400.0, 300.0)) 
+                            .fit_to_exact_size(img_size)
+                            // 3. Add your styling
+                            .corner_radius(8.0);
+                        ui.add(preview_image);
+                    } */
+                if let Some(texture_handle) =
+                    self.image_cache.get(&outfit.collage_path)
+                {
+                    ui.add(
+                        egui::Image::new(texture_handle)
+                            .fit_to_exact_size(egui::vec2(400.0, 300.0))
+                            .corner_radius(8.0)
+                    );
+                }
+
+                ui.add_space(15.0);
+
+                egui::Grid::new("outfit_metadata_grid").num_columns(2).spacing([40.0, 8.0]).show(ui, |ui| {
+                    ui.label("Style:"); ui.label(&outfit.style); ui.end_row();
+                    ui.label("Occasion:"); ui.label(&outfit.occasion); ui.end_row();
+                    ui.label("Seasons:"); ui.label(outfit.season.join(", ")); ui.end_row();
+                    
+                    let rating_str = outfit.user_rating.map(|r| r.to_string()).unwrap_or_else(|| "Unrated".to_string());
+                    ui.label("Score / Rating:"); ui.label(format!("Score: {} | User Rating: {}", outfit.score, rating_str)); ui.end_row();
+
+                    let last_worn_str = outfit.last_worn.as_deref().unwrap_or("Never");
+                    ui.label("Stats:"); ui.label(format!("Worn {} times (Last: {})", outfit.times_worn, last_worn_str)); ui.end_row();
+                });
+
+                if !outfit.reasoning.is_empty() {
+                    ui.add_space(15.0);
+                    ui.strong("AI Styling Reasoning:");
+                    for line in &outfit.reasoning {
+                        ui.label(format!("• {}", line));
                     }
                 }
-            });
-        }
 
-        if go_back { self.selected_outfit_id = None; }
-        if let Some(target_id) = jump_to_inventory_id {
-            // 1. Remember what outfit we are currently looking at!
-            self.navigation_source_outfit_id = self.selected_outfit_id.clone(); 
-            
-            // 2. Jump to the item
-            self.selected_inventory_item_id = Some(target_id);
-            self.active_tab = Tab::Inventory;
-        }
+                ui.add_space(20.0);
+                ui.heading("Included Inventory Items:");
+                ui.horizontal_wrapped(|ui| {
+                    // Collect data to break the borrow
+                    let sub_items: Vec<(String, String, String)> = outfit.items.iter()
+                        .filter_map(|id| self.inventory_map.get(id))
+                        .map(|item| (item.id.clone(), item.category.clone(), item.image_path.clone()))
+                        .collect();
+
+                    for (id, category, path) in sub_items {
+                        let sub_texture_id = self.get_cached_image(ui.ctx(), &path);
+                        
+                        // 1. Allocate the space for the card
+                        let (rect, response) = ui.allocate_exact_size(egui::vec2(90.0, 110.0), egui::Sense::click());
+                        
+                        // 2. Draw the background
+                        let bg_color = if response.hovered() { egui::Color32::from_rgb(50, 70, 100) } else { egui::Color32::from_rgb(30, 45, 70) };
+                        ui.painter().rect_filled(rect, 5.0, bg_color);
+                        
+                        // 3. Use allocate_ui_at_rect to perfectly center content inside the card
+                        ui.allocate_ui_at_rect(rect, |ui| {
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(5.0);
+                                
+                                // Draw the image centered
+                                ui.add(egui::Image::from_texture((sub_texture_id, egui::vec2(80.0, 75.0))).corner_radius(3.0));
+                                
+                                ui.add_space(5.0);
+                                
+                                // Draw the text centered
+                                ui.label(egui::RichText::new(&category).size(10.0).color(egui::Color32::WHITE));
+                            });
+                        });
+
+                        // 4. Handle click logic
+                        if response.clicked() {
+                            jump_to_inventory_id = Some(id); // Or use your logic to find the original ID
+                        }
+                    }
+                });
+
+                if go_back { self.selected_outfit_id = None; }
+                if let Some(target_id) = jump_to_inventory_id {
+                    // 1. Remember what outfit we are currently looking at!
+                    self.navigation_source_outfit_id = self.selected_outfit_id.clone(); 
+                    
+                    // 2. Jump to the item
+                    self.selected_inventory_item_id = Some(target_id);
+                    self.active_tab = Tab::Inventory;
+                }
+            }
         } else {
             // --- OUTFIT GRID VIEW ---
             ui.heading("Outfits");
+            if ui.button("➕ Create Outfit").clicked() {
+                self.show_create_outfit_popup = true;
+            }
             egui::ScrollArea::vertical().show(ui, |ui| {
                 let outfits_to_render: Vec<(String, String, String)> =
                     self.outfits_list
@@ -505,6 +746,7 @@ impl MyApp {
                 });
             });
         }
+        
     }
     fn process_new_item_with_ai(original_path_str: String) -> std::sync::mpsc::Receiver<Result<InventoryItem, String>> {
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -522,7 +764,7 @@ impl MyApp {
                 // 1. Generate Unique ID and copy the file locally
                 let item_id = format!("item_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
                 let extension = src_path.extension().and_then(|os| os.to_str()).unwrap_or("png");
-                let local_image_path = format!("assets/{}.{}", item_id, extension);
+                let local_image_path = format!("assets/items/{}.{}", item_id, extension);
                 
                 if std::fs::create_dir_all("assets").is_err() || std::fs::copy(&src_path, &local_image_path).is_err() {
                     let _ = sender.send(Err("Failed to save copy to assets folder".to_string()));
@@ -535,14 +777,14 @@ impl MyApp {
                 // 3. Build the strict prompt
                 let prompt = "Analyze this clothing item image. Output exactly a valid raw JSON object matching this schema structure. Do not wrap it inside a markdown block:
 {
-  \"category\": \"Shirt/Pants/Jacket/Shoes/etc\",
+  \"category\": \"Shirt/Pants/Jacket/Shoes/etc, can choose others than these\",
   \"primary_color\": \"dominant color\",
   \"secondary_color\": \"accent color or None\",
-  \"style\": \"Casual/Formal/Sporty/etc\",
+  \"style\": \"Casual/Formal/Sporty/etc, can choose others than these\",
   \"season\": \"Summer/Winter/Spring/Autumn\",
-  \"occasion\": \"Everyday/Work/Party/etc\",
+  \"occasion\": \"Everyday/Work/Party/etc, can choose others than these\",
   \"material\": \"Cotton/Denim/Leather/etc\",
-  \"fit\": \"Regular/Slim/Oversized/etc\"
+  \"fit\": \"Regular/Slim/Relaxed/Baggy\"
 }".to_string();
 
                 // 4. Create the generation request with the image attached via its path
@@ -553,10 +795,15 @@ impl MyApp {
                 use base64::Engine;
                 let b64_str = base64::engine::general_purpose::STANDARD.encode(file_bytes);
                 let ollama_image = ollama_rs::generation::images::Image::from_base64(b64_str);
+                let fast_options = ollama_rs::models::ModelOptions::default()
+                    .temperature(0.0)      // 0.0 makes the model deterministic and much faster
+                    .num_predict(120)      // Caps the length so it stops instantly when JSON finishes
+                    .top_k(20)             // Limits pool of choices for quicker token evaluation
+                    .top_p(0.5);
                 let request = ollama_rs::generation::completion::request::GenerationRequest::new(
                     "gemma3:4b".to_string(),
                     prompt,
-                )
+                ).options(fast_options)
                 .add_image(ollama_image); // ollama-rs handles the base64 translation automatically here!
 
                 // 5. Run the model request
@@ -716,6 +963,7 @@ impl MyApp {
     }
 
 }
+
 fn create_outfit_collage(image_paths: &[String]) -> RgbaImage {
     // 1. Create a blank canvas (e.g., 400x400)
     let mut canvas = RgbaImage::new(400, 400);
@@ -751,7 +999,7 @@ fn ensure_json_files_exist() {
                 occasion: "Everyday".to_string(),
                 material: "Cotton".to_string(),
                 fit: "Regular".to_string(),
-                image_path: "assets/sample_shirt.png".to_string(),
+                image_path: "assets/items/sample_shirt.png".to_string(),
             }
         ];
         
@@ -826,6 +1074,9 @@ fn main() -> eframe::Result<()> {
                 outfits_list,
                 selected_inventory_item_id: None,
                 selected_outfit_id: None,
+                show_create_outfit_popup: false,
+                outfit_prompt: String::new(),
+                outfit_state: OutfitState::Idle,
                 outfit_collage_cache: HashMap::new(),
                 navigation_source_outfit_id: None,
                 add_item_state: AddItemState::Idle { error: None },
