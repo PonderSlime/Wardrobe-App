@@ -1,10 +1,12 @@
 use eframe::egui;
+use rfd::MessageDialogResult::No;
 use std::time::Instant;
 use std::fs;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use image::{GenericImage, GenericImageView, RgbaImage};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InventoryItem {
@@ -29,6 +31,7 @@ pub struct Outfit {
     pub season: Vec<String>,                    // "season": []
     pub weather: serde_json::Value,             // "weather": {} -> holds arbitrary JSON object data
     pub items: Vec<String>,                     // Array of InventoryItem IDs
+    pub collage_path: String,
     pub score: i32,
     pub user_rating: Option<f32>,               // Option handles null values
     pub liked: bool,
@@ -49,8 +52,11 @@ enum Tab {
 
 // 2. Define the state for the "Add Item" loading sequence
 enum AddItemState {
-    Idle,
+    Idle { error: Option<String> },
     Loading { start_time: Instant, file_path: String },
+    ProcessingAI {
+        receiver: std::sync::mpsc::Receiver<Result<InventoryItem, String>>,
+    },
     ViewingDetails { 
         file_path: String, 
         texture: egui::TextureHandle // Store the loaded texture here
@@ -65,10 +71,13 @@ struct MyApp {
     inventory_map: HashMap<String, InventoryItem>, // Quick lookup by ID
     inventory_list: Vec<InventoryItem>,            // Ordered list for the grid
     outfits_list: Vec<Outfit>,
-    
+    outfit_collage_cache: HashMap<String, egui::TextureHandle>,
     // UI Selection Tracking (Now tracking by string IDs)
     selected_inventory_item_id: Option<String>,
     selected_outfit_id: Option<String>,
+
+    navigation_source_outfit_id: Option<String>,
+
     image_cache: std::collections::HashMap<String, egui::TextureHandle>,
     add_item_state: AddItemState,
 }
@@ -81,8 +90,10 @@ impl Default for MyApp {
             inventory_list: Vec::new(),                      // Initialized empty
             outfits_list: Vec::new(),                        // Initialized empty
             selected_inventory_item_id: None,
+            outfit_collage_cache: HashMap::new(),
             selected_outfit_id: None,
-            add_item_state: AddItemState::Idle,
+            navigation_source_outfit_id: None,
+            add_item_state: AddItemState::Idle { error: None },
             image_cache: std::collections::HashMap::new(),
         }
     }
@@ -175,66 +186,125 @@ impl MyApp {
     // TAB 1: Inventory
     fn show_inventory(&mut self, ui: &mut egui::Ui) {
         if let Some(item_id) = self.selected_inventory_item_id.clone() {
-        // --- DETAIL VIEW ---
-        let mut go_back = false;
-        if ui.button("⬅ Back to Inventory").clicked() {
-            go_back = true;
-        }
-        ui.separator();
+            // --- DETAIL VIEW ---
+            let mut go_back = false;
+            let mut return_to_outfit = false;
 
-        // Step A: Extract only the image path we need to clear the borrow context
-        let img_path = self.inventory_map.get(&item_id).map(|item| item.image_path.clone());
+            // Dynamic Back Button text based on where the user came from
+            let back_text = if self.navigation_source_outfit_id.is_some() {
+                "⬅ Back to Outfit"
+            } else {
+                "⬅ Back to Inventory"
+            };
 
-        // Step B: Now we can safely invoke the mutable image cache lookup
-        let texture_id = if let Some(path) = &img_path {
-            &self.get_cached_image(ui.ctx(), path)
+            if ui.button(back_text).clicked() {
+                if self.navigation_source_outfit_id.is_some() {
+                    return_to_outfit = true;
+                } else {
+                    go_back = true;
+                }
+            }
+            ui.separator();
+            // Step A: Extract only the image path we need to clear the borrow context
+            let img_path = self.inventory_map.get(&item_id).map(|item| item.image_path.clone());
+
+            // Step B: Now we can safely invoke the mutable image cache lookup
+            let texture_id = if let Some(path) = &img_path {
+                &self.get_cached_image(ui.ctx(), path)
+            } else {
+                &self.get_cached_image(ui.ctx(), "")
+            };
+
+            // Step C: Look up the item data *again* to draw the text properties safely
+            if let Some(item) = self.inventory_map.get(&item_id) {
+                ui.heading(format!("Item: {}", item.id));
+                
+                // Draw real image
+                let img_size = egui::vec2(400.0,300.0);
+                if let Some(texture_handle) = self.image_cache.get(&item.image_path) {
+                    let preview_image = egui::Image::new(texture_handle)
+                        // 2. Set your bounding box
+                        .max_size(egui::vec2(400.0, 300.0)) 
+                        .fit_to_exact_size(img_size)
+                        // 3. Add your styling
+                        .corner_radius(8.0);
+                    ui.add(preview_image);
+                }
+                ui.add_space(10.0);
+                
+                egui::Grid::new("item_properties").num_columns(2).spacing([40.0, 8.0]).show(ui, |ui| {
+                    ui.label("Category:"); ui.label(&item.category); ui.end_row();
+                    ui.label("Style:"); ui.label(&item.style); ui.end_row();
+                    ui.label("Season:"); ui.label(&item.season); ui.end_row();
+                    ui.label("Occasion:"); ui.label(&item.occasion); ui.end_row();
+                    ui.label("Colors:"); ui.label(format!("{}, {}", item.primary_color, item.secondary_color)); ui.end_row();
+                    ui.label("Material:"); ui.label(&item.material); ui.end_row();
+                    ui.label("Fit:"); ui.label(&item.fit); ui.end_row();
+                });
+            }
+
+            if go_back {
+                self.selected_inventory_item_id = None;
+            }
+
+            if return_to_outfit {
+                // 1. Point our outfit manager right back to the original outfit
+                self.selected_outfit_id = self.navigation_source_outfit_id.clone();
+                // 2. Flip tabs back to outfits
+                self.active_tab = Tab::Outfits;
+                // 3. Reset the navigational state tracker
+                self.selected_inventory_item_id = None;
+                self.navigation_source_outfit_id = None;
+            }
         } else {
-            &self.get_cached_image(ui.ctx(), "")
-        };
-
-        // Step C: Look up the item data *again* to draw the text properties safely
-        if let Some(item) = self.inventory_map.get(&item_id) {
-            ui.heading(format!("Item: {}", item.id));
-            
-            // Draw real image
-            ui.add(egui::Image::from_texture((*texture_id, egui::vec2(400.0, 300.0))).corner_radius(8.0));
-            ui.add_space(10.0);
-            
-            egui::Grid::new("item_properties").num_columns(2).spacing([40.0, 8.0]).show(ui, |ui| {
-                ui.label("Category:"); ui.label(&item.category); ui.end_row();
-                ui.label("Style:"); ui.label(&item.style); ui.end_row();
-                ui.label("Season:"); ui.label(&item.season); ui.end_row();
-                ui.label("Occasion:"); ui.label(&item.occasion); ui.end_row();
-                ui.label("Colors:"); ui.label(format!("{}, {}", item.primary_color, item.secondary_color)); ui.end_row();
-                ui.label("Material:"); ui.label(&item.material); ui.end_row();
-                ui.label("Fit:"); ui.label(&item.fit); ui.end_row();
-            });
-        }
-
-        if go_back {
-            self.selected_inventory_item_id = None;
-        }
-        } else {
-            // --- GRID VIEW ---
+            self.navigation_source_outfit_id = None;
             ui.heading("Inventory");
+            // Pre-collect data so we don't hold a reference to 'self.inventory_list' during the loop
+            let items_to_render: Vec<(String, String)> = self.inventory_list
+                .iter()
+                .map(|i| (i.category.clone(), i.image_path.clone()))
+                .collect();
+
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    // Ensure this points to self.inventory_list!
-                    for item in &self.inventory_list {
-                        let (rect, response) = ui.allocate_exact_size(egui::vec2(100.0, 120.0), egui::Sense::click());
-                        let color = if response.hovered() { egui::Color32::GRAY } else { egui::Color32::DARK_GRAY };
-                        ui.painter().rect_filled(rect, 5.0, color);
+                    for (category, path) in items_to_render {
+                        let texture_id = self.get_cached_image(ui.ctx(), &path);
                         
-                        ui.painter().text(
-                            rect.center_bottom() - egui::vec2(0.0, 12.0), 
-                            egui::Align2::CENTER_BOTTOM, 
-                            &item.category, 
-                            egui::FontId::proportional(12.0), 
-                            egui::Color32::WHITE
-                        );
+                        // 1. Allocate the click area
+                        let card_size = egui::vec2(200.0, 240.0);
+                        let (rect, response) = ui.allocate_exact_size(card_size, egui::Sense::click());
+                        
+                        // 2. Draw the background card
+                        let bg_color = if response.hovered() { egui::Color32::from_gray(70) } else { egui::Color32::from_gray(40) };
+                        ui.painter().rect_filled(rect, 6.0, bg_color);
+                        
+                        // 3. Create a sub-UI area strictly for the content inside this rectangle
+                        ui.allocate_ui_at_rect(rect, |ui| {
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(5.0); // Padding from top
+                                
+                                // Draw the Image
+                                //ui.add(egui::Image::from_texture((texture_id, egui::vec2(90.0, 85.0))).corner_radius(4.0));
+                                let size = egui::vec2( 200.0, 200.0);
+                                if let Some(texture_handle) = self.image_cache.get(&path) {
+                                    let thumbnail = egui::Image::new(texture_handle)
+                                        .max_size(size)
+                                        .fit_to_exact_size(size)
+                                        .corner_radius(4.0);
+                                        
+                                    ui.add(thumbnail);
+                                }
+                                ui.add_space(5.0); // Gap between image and text
+                                
+                                // Draw the Label
+                                ui.label(egui::RichText::new(&category).size(11.0).color(egui::Color32::WHITE));
+                            });
+                        });
 
                         if response.clicked() {
-                            self.selected_inventory_item_id = Some(item.id.clone());
+                            if let Some(item) = self.inventory_list.iter().find(|i| i.image_path == path) {
+                                self.selected_inventory_item_id = Some(item.id.clone());
+                            }
                         }
                     }
                 });
@@ -258,18 +328,9 @@ impl MyApp {
         let current_outfit = self.outfits_list.iter().find(|o| o.id == *outfit_id).cloned();
 
         if let Some(outfit) = current_outfit {
-            // Step B: Get the image path of the first item belonging to this outfit
-            let mut img_path = String::new();
-            if let Some(first_item_id) = outfit.items.first() {
-                if let Some(item) = self.inventory_map.get(first_item_id) {
-                    img_path = item.image_path.clone();
-                }
-            }
 
-            // Step C: Secure the texture ID safely
-            let texture_id = self.get_cached_image(ui.ctx(), &img_path);
-
-            // Step D: Render the UI without any closure or borrow errors!
+            let texture_id =
+                self.get_cached_image(ui.ctx(), &outfit.collage_path);
             ui.horizontal(|ui| {
                 ui.heading(&outfit.name);
                 if outfit.favorite { ui.colored_label(egui::Color32::from_rgb(255, 215, 0), "⭐ Favorite"); }
@@ -280,7 +341,26 @@ impl MyApp {
             ui.add_space(10.0);
 
             // Draw the outfit image
-            ui.add(egui::Image::from_texture((texture_id, egui::vec2(400.0, 300.0))).corner_radius(8.0));
+            let img_size = egui::vec2(400.0,300.0);
+            /* if let Some(texture_handle) = self.image_cache.get(&img_path) {
+                    let preview_image = egui::Image::new(texture_handle)
+                        // 2. Set your bounding box
+                        .max_size(egui::vec2(400.0, 300.0)) 
+                        .fit_to_exact_size(img_size)
+                        // 3. Add your styling
+                        .corner_radius(8.0);
+                    ui.add(preview_image);
+                } */
+            if let Some(texture_handle) =
+                self.image_cache.get(&outfit.collage_path)
+            {
+                ui.add(
+                    egui::Image::new(texture_handle)
+                        .fit_to_exact_size(egui::vec2(400.0, 300.0))
+                        .corner_radius(8.0)
+                );
+            }
+
             ui.add_space(15.0);
 
             egui::Grid::new("outfit_metadata_grid").num_columns(2).spacing([40.0, 8.0]).show(ui, |ui| {
@@ -306,19 +386,40 @@ impl MyApp {
             ui.add_space(20.0);
             ui.heading("Included Inventory Items:");
             ui.horizontal_wrapped(|ui| {
-                for item_id in &outfit.items {
-                    if let Some(inventory_item) = self.inventory_map.get(item_id) {
-                        let (rect, response) = ui.allocate_exact_size(egui::vec2(90.0, 110.0), egui::Sense::click());
-                        let color = if response.hovered() { egui::Color32::LIGHT_BLUE } else { egui::Color32::BLUE };
-                        ui.painter().rect_filled(rect, 5.0, color);
-                        
-                        ui.painter().text(rect.center_bottom() - egui::vec2(0.0, 10.0), egui::Align2::CENTER_BOTTOM, &inventory_item.category, egui::FontId::proportional(11.0), egui::Color32::WHITE);
+                // Collect data to break the borrow
+                let sub_items: Vec<(String, String, String)> = outfit.items.iter()
+                    .filter_map(|id| self.inventory_map.get(id))
+                    .map(|item| (item.id.clone(), item.category.clone(), item.image_path.clone()))
+                    .collect();
 
-                        if response.clicked() {
-                            jump_to_inventory_id = Some(inventory_item.id.clone());
-                        }
-                    } else {
-                        ui.colored_label(egui::Color32::RED, format!("Missing Item [{}]", item_id));
+                for (id, category, path) in sub_items {
+                    let sub_texture_id = self.get_cached_image(ui.ctx(), &path);
+                    
+                    // 1. Allocate the space for the card
+                    let (rect, response) = ui.allocate_exact_size(egui::vec2(90.0, 110.0), egui::Sense::click());
+                    
+                    // 2. Draw the background
+                    let bg_color = if response.hovered() { egui::Color32::from_rgb(50, 70, 100) } else { egui::Color32::from_rgb(30, 45, 70) };
+                    ui.painter().rect_filled(rect, 5.0, bg_color);
+                    
+                    // 3. Use allocate_ui_at_rect to perfectly center content inside the card
+                    ui.allocate_ui_at_rect(rect, |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(5.0);
+                            
+                            // Draw the image centered
+                            ui.add(egui::Image::from_texture((sub_texture_id, egui::vec2(80.0, 75.0))).corner_radius(3.0));
+                            
+                            ui.add_space(5.0);
+                            
+                            // Draw the text centered
+                            ui.label(egui::RichText::new(&category).size(10.0).color(egui::Color32::WHITE));
+                        });
+                    });
+
+                    // 4. Handle click logic
+                    if response.clicked() {
+                        jump_to_inventory_id = Some(id); // Or use your logic to find the original ID
                     }
                 }
             });
@@ -326,6 +427,10 @@ impl MyApp {
 
         if go_back { self.selected_outfit_id = None; }
         if let Some(target_id) = jump_to_inventory_id {
+            // 1. Remember what outfit we are currently looking at!
+            self.navigation_source_outfit_id = self.selected_outfit_id.clone(); 
+            
+            // 2. Jump to the item
             self.selected_inventory_item_id = Some(target_id);
             self.active_tab = Tab::Inventory;
         }
@@ -333,25 +438,176 @@ impl MyApp {
             // --- OUTFIT GRID VIEW ---
             ui.heading("Outfits");
             egui::ScrollArea::vertical().show(ui, |ui| {
+                let outfits_to_render: Vec<(String, String, String)> =
+                    self.outfits_list
+                        .iter()
+                        .map(|o| (
+                            o.id.clone(),
+                            o.name.clone(),
+                            o.collage_path.clone(),
+                        ))
+                        .collect();
                 ui.horizontal_wrapped(|ui| {
-                    for outfit in &self.outfits_list {
-                        let (rect, response) = ui.allocate_exact_size(egui::vec2(130.0, 130.0), egui::Sense::click());
-                        let color = if response.hovered() { egui::Color32::DARK_GREEN } else { egui::Color32::from_rgb(34, 112, 63) };
-                        ui.painter().rect_filled(rect, 8.0, color);
-                        
-                        // Display the Outfit's text Name instead of ID inside the grid cards
-                        let display_name = if outfit.name.is_empty() { &outfit.id } else { &outfit.name };
-                        ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, display_name, egui::FontId::proportional(14.0), egui::Color32::WHITE);
+                    for (id, name, collage_path) in outfits_to_render {
+
+                        let texture_id =
+                            self.get_cached_image(ui.ctx(), &collage_path);
+
+                        let card_size = egui::vec2(220.0, 260.0);
+
+                        let (rect, response) =
+                            ui.allocate_exact_size(
+                                card_size,
+                                egui::Sense::click(),
+                            );
+
+                        let bg_color = if response.hovered() {
+                            egui::Color32::from_gray(70)
+                        } else {
+                            egui::Color32::from_gray(40)
+                        };
+
+                        ui.painter()
+                            .rect_filled(rect, 6.0, bg_color);
+
+                        ui.allocate_ui_at_rect(rect, |ui| {
+                            ui.vertical_centered(|ui| {
+
+                                ui.add_space(5.0);
+
+                                if let Some(texture_handle) =
+                                    self.image_cache.get(&collage_path)
+                                {
+                                    let thumbnail =
+                                        egui::Image::new(texture_handle)
+                                            .fit_to_exact_size(
+                                                egui::vec2(210.0, 210.0)
+                                            )
+                                            .corner_radius(4.0);
+
+                                    ui.add(thumbnail);
+                                }
+
+                                ui.add_space(5.0);
+
+                                ui.label(
+                                    egui::RichText::new(&name)
+                                        .size(11.0)
+                                        .color(egui::Color32::WHITE)
+                                );
+                            });
+                        });
 
                         if response.clicked() {
-                            self.selected_outfit_id = Some(outfit.id.clone());
+                            self.selected_outfit_id = Some(id);
                         }
                     }
                 });
             });
         }
     }
+    fn process_new_item_with_ai(original_path_str: String) -> std::sync::mpsc::Receiver<Result<InventoryItem, String>> {
+        let (sender, receiver) = std::sync::mpsc::channel();
 
+        std::thread::spawn(move || {
+            // Create a basic tokio runtime to run the async ollama commands inside our thread
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(r) => r,
+                Err(e) => { let _ = sender.send(Err(e.to_string())); return; }
+            };
+
+            rt.block_on(async {
+                let src_path = std::path::Path::new(&original_path_str);
+                
+                // 1. Generate Unique ID and copy the file locally
+                let item_id = format!("item_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
+                let extension = src_path.extension().and_then(|os| os.to_str()).unwrap_or("png");
+                let local_image_path = format!("assets/{}.{}", item_id, extension);
+                
+                if std::fs::create_dir_all("assets").is_err() || std::fs::copy(&src_path, &local_image_path).is_err() {
+                    let _ = sender.send(Err("Failed to save copy to assets folder".to_string()));
+                    return;
+                }
+
+                // 2. Initialize the local Ollama client (defaults to localhost:11434)
+                let ollama = ollama_rs::Ollama::default();
+
+                // 3. Build the strict prompt
+                let prompt = "Analyze this clothing item image. Output exactly a valid raw JSON object matching this schema structure. Do not wrap it inside a markdown block:
+{
+  \"category\": \"Shirt/Pants/Jacket/Shoes/etc\",
+  \"primary_color\": \"dominant color\",
+  \"secondary_color\": \"accent color or None\",
+  \"style\": \"Casual/Formal/Sporty/etc\",
+  \"season\": \"Summer/Winter/Spring/Autumn\",
+  \"occasion\": \"Everyday/Work/Party/etc\",
+  \"material\": \"Cotton/Denim/Leather/etc\",
+  \"fit\": \"Regular/Slim/Oversized/etc\"
+}".to_string();
+
+                // 4. Create the generation request with the image attached via its path
+                let file_bytes = match std::fs::read(&local_image_path) {
+                    Ok(bytes) => bytes,
+                    Err(e) => { let _ = sender.send(Err(format!("Failed to read cloned file bytes: {}", e))); return; }
+                };
+                use base64::Engine;
+                let b64_str = base64::engine::general_purpose::STANDARD.encode(file_bytes);
+                let ollama_image = ollama_rs::generation::images::Image::from_base64(b64_str);
+                let request = ollama_rs::generation::completion::request::GenerationRequest::new(
+                    "gemma3:4b".to_string(),
+                    prompt,
+                )
+                .add_image(ollama_image); // ollama-rs handles the base64 translation automatically here!
+
+                // 5. Run the model request
+                let response = match ollama.generate(request).await {
+                    Ok(res) => res.response,
+                    Err(e) => { let _ = sender.send(Err(format!("Ollama error: {}", e))); return; }
+                };
+
+                // 6. Clean up the response from any accidental markdown block wrappers
+                let clean_json = response.trim_start_matches("```json")
+                    .trim_start_matches("```")
+                    .trim_end_matches("```")
+                    .trim();
+
+                // 7. Parse the cleaned string into our local structures
+                let mut parsed_data: serde_json::Value = match serde_json::from_str(clean_json) {
+                    Ok(v) => v,
+                    Err(e) => { 
+                        let _ = sender.send(Err(format!("JSON Parse Fail: {}. Raw output was: {}", e, response))); 
+                        return; 
+                    }
+                };
+
+                // Inject our systemic application structural meta values
+                parsed_data["id"] = serde_json::Value::String(item_id.clone());
+                parsed_data["image_path"] = serde_json::Value::String(local_image_path);
+
+                let final_item: InventoryItem = match serde_json::from_value(parsed_data) {
+                    Ok(item) => item,
+                    Err(e) => { let _ = sender.send(Err(format!("Schema mapping failure: {}", e))); return; }
+                };
+
+                // 8. Save directly to the local JSON database file
+                let mut current_items: Vec<InventoryItem> = std::fs::read_to_string("inventory.json")
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default();
+
+                current_items.push(final_item.clone());
+
+                if let Ok(updated_string) = serde_json::to_string_pretty(&current_items) {
+                    let _ = std::fs::write("inventory.json", updated_string);
+                }
+
+                // Send the ready item straight back to our main eframe loop
+                let _ = sender.send(Ok(final_item));
+            });
+        });
+
+        receiver
+    }
     // TAB 3: Add Item
     fn show_add_item(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         ui.vertical_centered(|ui| {
@@ -363,7 +619,22 @@ impl MyApp {
 
             // 2. Match on the current state (borrowing it)
             match &self.add_item_state {
-                AddItemState::Idle => {
+                AddItemState::Idle { error} => {
+                    if let Some(err_msg) = error {
+                        ui.add_space(10.0);
+                        egui::Frame::none()
+                            .fill(egui::Color32::from_rgb(70, 20, 20)) // Dark red warning box
+                            .stroke(egui::Stroke::new(1.0, egui::Color32::LIGHT_RED))
+                            .corner_radius(6.0)
+                            .inner_margin(12.0)
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("⚠️ Pipeline Error:").strong().color(egui::Color32::LIGHT_RED));
+                                    ui.label(egui::RichText::new(err_msg).color(egui::Color32::WHITE));
+                                });
+                            });
+                        ui.add_space(15.0);
+                    }
                     if ui.button("Select Image from OS").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("image", &["png", "jpg", "jpeg", "webp"])
@@ -378,38 +649,50 @@ impl MyApp {
                     }
                 }
                 AddItemState::Loading { start_time, file_path } => {
-                    ui.spinner(); 
-                    ui.label("Processing image...");
+                    ui.spinner();
+                    ui.label("Preparing file path selection...");
                     ctx.request_repaint();
 
-                    // Inside Tab::AddItem -> AddItemState::Loading arm:
-                    if start_time.elapsed().as_secs() >= 2 {
-                        // 1. Read the raw file bytes from the OS path
-                        if let Ok(file_bytes) = std::fs::read(&file_path) {
-                            
-                            // 2. Convert those bytes into an egui-compatible ColorImage
-                            if let Ok(color_image) = egui_extras::image::load_image_bytes(&file_bytes) {
-                                
-                                // 3. Upload the image to the GPU graphics context
-                                let texture = ctx.load_texture(
-                                    "user_uploaded_item",
-                                    color_image,
-                                    Default::default()
-                                );
+                    // Instead of doing the fs::read here, we trigger the background thread immediately!
+                    if start_time.elapsed().as_millis() >= 100 {
+                        // Start up the background thread processing chain using the path picked by the user
+                        let rx = Self::process_new_item_with_ai(file_path.clone());
+                        next_state = Some(AddItemState::ProcessingAI { receiver: rx });
+                    }
+                }
+                AddItemState::ProcessingAI { receiver } => {
+                    ui.spinner();
+                    ui.colored_label(egui::Color32::LIGHT_BLUE, "🤖 Ollama Gemma3:4b is analyzing garment properties...");
+                    ctx.request_repaint();
 
-                                // 4. Move to the details view and hand over the texture
-                                next_state = Some(AddItemState::ViewingDetails {
-                                    file_path: file_path.clone(),
-                                    texture, 
-                                });
+                    if let Ok(result) = receiver.try_recv() {
+                        match result {
+                            Ok(new_item) => {
+                                if let Ok(file_bytes) = std::fs::read(&new_item.image_path) {
+                                    if let Ok(color_image) = egui_extras::image::load_image_bytes(&file_bytes) {
+                                        let texture = ctx.load_texture(&new_item.image_path, color_image, Default::default());
+                                        
+                                        self.inventory_list.push(new_item.clone());
+                                        self.inventory_map.insert(new_item.id.clone(), new_item.clone());
+
+                                        next_state = Some(AddItemState::ViewingDetails {
+                                            file_path: new_item.image_path.clone(),
+                                            texture,
+                                        });
+                                    }
+                                }
                             }
+                        Err(err_msg) => {
+                                println!("❌ AI pipeline broke: {}", err_msg);
+                            next_state = Some(AddItemState::Idle { error: Some(err_msg) });
+                        }
                         }
                     }
                 }
                 // Inside Tab::AddItem -> AddItemState::ViewingDetails arm:
                 AddItemState::ViewingDetails { file_path, texture } => {
                     if ui.button("⬅ Cancel / Add Another").clicked() {
-                        next_state = Some(AddItemState::Idle);
+                        next_state = Some(AddItemState::Idle { error: None });
                     }
                     ui.separator();
                     ui.heading("New Item Processed!");
@@ -431,7 +714,29 @@ impl MyApp {
             }
         });
     }
+
 }
+fn create_outfit_collage(image_paths: &[String]) -> RgbaImage {
+    // 1. Create a blank canvas (e.g., 400x400)
+    let mut canvas = RgbaImage::new(400, 400);
+
+    // 2. Load and draw each item (simplified example)
+    for (i, path) in image_paths.iter().enumerate() {
+        if let Ok(img) = image::open(path) {
+            // Resize image to fit a section of the canvas
+            let scaled = img.resize(200, 200, image::imageops::FilterType::Lanczos3);
+            
+            // Calculate position (e.g., a simple 2x2 grid)
+            let x = (i % 2 * 200) as u32;
+            let y = (i / 2 * 200) as u32;
+            
+            // Paste the item onto the canvas
+            canvas.copy_from(&scaled, x, y).unwrap();
+        }
+    }
+    canvas
+}
+
 fn ensure_json_files_exist() {
     // 1. Ensure inventory.json exists
     if !Path::new("inventory.json").exists() {
@@ -521,7 +826,9 @@ fn main() -> eframe::Result<()> {
                 outfits_list,
                 selected_inventory_item_id: None,
                 selected_outfit_id: None,
-                add_item_state: AddItemState::Idle,
+                outfit_collage_cache: HashMap::new(),
+                navigation_source_outfit_id: None,
+                add_item_state: AddItemState::Idle { error: None },
                 image_cache: std::collections::HashMap::new(),
             };
 
